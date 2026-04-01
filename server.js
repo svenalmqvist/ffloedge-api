@@ -3,7 +3,7 @@ const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 const YEAR = 2026;
 
 // AFLTables all-teams season totals page — updates within hours of each game
