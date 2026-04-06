@@ -383,8 +383,15 @@ async function fetchFixture() {
   }
   completedRounds.sort((a, b) => a - b);
 
-  console.log(`Fixture: upcoming app round ${upcomingRound}, completed: [${completedRounds.join(', ')}]`);
-  return { nextGame, upcomingRound, completedRounds, historicalFixture, historicalByes };
+  // Cross-reference with AFL Tables: only include rounds that have game data
+  await refreshGameLinks();
+  const verified = completedRounds.filter(r => {
+    const afltablesRound = r + 1;
+    return cachedGameLinks[afltablesRound]?.length > 0;
+  });
+
+  console.log(`Fixture: upcoming app round ${upcomingRound}, completed: [${completedRounds.join(', ')}], verified with AFL Tables: [${verified.join(', ')}]`);
+  return { nextGame, upcomingRound, completedRounds: verified, historicalFixture, historicalByes };
 }
 
 async function getOrFetchFixture() {
