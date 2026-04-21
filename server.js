@@ -269,17 +269,17 @@ app.get('/api/utilities', async (req, res) => {
   }
 });
 
-// ── Fixture (next opponent) via Squiggle API ──────────────────────────────────
-const SQUIGGLE_TO_APP = {
+// ── Fixture via AFL Tables season page (replaces Squiggle) ───────────────────
+// AFL Tables short name → full app team name
+const AFLTABLES_TO_APP = {
   'Adelaide':               'Adelaide Crows',
-  'Brisbane':               'Brisbane Lions',
+  'Brisbane Lions':         'Brisbane Lions',
   'Carlton':                'Carlton Blues',
   'Collingwood':            'Collingwood Magpies',
   'Essendon':               'Essendon Bombers',
   'Fremantle':              'Fremantle Dockers',
   'Geelong':                'Geelong Cats',
   'Gold Coast':             'Gold Coast Suns',
-  'GWS':                    'GWS Giants',
   'Greater Western Sydney': 'GWS Giants',
   'Hawthorn':               'Hawthorn Hawks',
   'Melbourne':              'Melbourne Demons',
@@ -291,112 +291,116 @@ const SQUIGGLE_TO_APP = {
   'West Coast':             'West Coast Eagles',
   'Western Bulldogs':       'Western Bulldogs',
 };
+// Keep SQUIGGLE_TO_APP as an alias (used elsewhere for stats team name mapping)
+const SQUIGGLE_TO_APP = AFLTABLES_TO_APP;
+
+const ALL_TEAMS = Object.values(AFLTABLES_TO_APP);
 
 let cachedFixture = null;
 let fixtureCachedAt = 0;
 const FIXTURE_TTL = 60 * 60 * 1000; // 1 hour
 
 async function fetchFixture() {
-  const r = await fetch('https://api.squiggle.com.au/?q=games;year=2026', {
-    headers: { 'User-Agent': 'FFLoEDGE/1.0 (fantasy stats app)' },
-  });
-  if (!r.ok) throw new Error(`Squiggle HTTP ${r.status}`);
-  const { games } = await r.json();
+  // Fetch AFL Tables season page for fixture + game links for completedRounds
+  const [seasRes] = await Promise.all([
+    fetch(`https://afltables.com/afl/seas/${YEAR}.html`, { headers: HEADERS }),
+    refreshGameLinks(),
+  ]);
+  if (!seasRes.ok) throw new Error(`AFL Tables season page HTTP ${seasRes.status}`);
+  const html = await seasRes.text();
 
-  const sorted = [...games].sort((a, b) => new Date(a.date) - new Date(b.date));
-  const allTeams = [...new Set(Object.values(SQUIGGLE_TO_APP))];
+  // Parse each round block: <a name="N"></a> ... next <a name=
+  // Each game is a pair of consecutive <tr> rows inside an inner table
+  const roundBlocks = html.split(/<a name=["']?(\d+)["']?><\/a>/);
+  // roundBlocks = [pre, '1', content1, '2', content2, ...]
 
-  // Find the upcoming round: lowest round with any unplayed game
-  let squiggleUpcoming = null;
-  for (const g of sorted) {
-    if (g.complete < 100 && g.hteam && g.ateam) {
-      squiggleUpcoming = g.round;
-      break;
+  // { afltablesRound: [ { home, away, played, date, venue } ] }
+  const roundGames = {};
+  for (let i = 1; i < roundBlocks.length - 1; i += 2) {
+    const afltablesRound = parseInt(roundBlocks[i]);
+    const content = roundBlocks[i + 1] || '';
+    const games = [];
+
+    // Each game is two consecutive <tr> rows: home row then away row
+    // Team name is inside <a href="../teams/...">NAME</a>
+    // A played game's away row contains "won by" or "drew"; upcoming has only date
+    const rowRegex = /<tr[^>]*>[\s\S]*?<\/tr>/g;
+    const rows = content.match(rowRegex) || [];
+
+    for (let j = 0; j < rows.length - 1; j++) {
+      const homeRow = rows[j];
+      const awayRow = rows[j + 1];
+      const homeName = (homeRow.match(/<a href="\.\.\/teams\/[^"]+">([^<]+)<\/a>/) || [])[1];
+      const awayName = (awayRow.match(/<a href="\.\.\/teams\/[^"]+">([^<]+)<\/a>/) || [])[1];
+      if (!homeName || !awayName) continue;
+
+      const home = AFLTABLES_TO_APP[homeName] || homeName;
+      const away = AFLTABLES_TO_APP[awayName] || awayName;
+
+      // Played if the away row mentions "won by", "drew", or has a stats link
+      const played = /won by|drew|Match stats/i.test(awayRow);
+
+      // Date from home row td containing a date pattern
+      const dateMatch = homeRow.match(/(\w{3}\s+\d{1,2}-\w{3}-\d{4}(?:\s+[\d:]+\s*(?:AM|PM))?)/i);
+      const date = dateMatch ? dateMatch[1] : null;
+
+      // Venue from href of venue link
+      const venueMatch = homeRow.match(/Venue:<\/b>\s*<a[^>]*>([^<]+)<\/a>/i);
+      const venue = venueMatch ? venueMatch[1].trim() : null;
+
+      games.push({ home, away, played, date, venue });
+      j++; // skip the away row
     }
-  }
-  // App rounds match Squiggle round numbers directly (Squiggle Round 0 = preseason, Round 1 = AFL Rd 1)
-  // AFLTables offset: afltablesRound = appRound + 1 (handled in scrapeRoundStats)
-  const upcomingRound = squiggleUpcoming !== null ? squiggleUpcoming : null;
-
-  // Build nextGame map
-  const nextGame = {};
-  if (squiggleUpcoming !== null) {
-    const roundGames = sorted.filter(g => g.round === squiggleUpcoming && g.hteam && g.ateam);
-    const playingThisRound = new Set();
-    for (const g of roundGames) {
-      const home = SQUIGGLE_TO_APP[g.hteam] || g.hteam;
-      const away = SQUIGGLE_TO_APP[g.ateam] || g.ateam;
-      playingThisRound.add(home);
-      playingThisRound.add(away);
-      if (g.complete < 100) {
-        nextGame[home] = { opponent: away, round: g.roundname, date: g.date, home: true,  venue: g.venue || null };
-        nextGame[away] = { opponent: home, round: g.roundname, date: g.date, home: false, venue: g.venue || null };
-      }
-    }
-    for (const team of allTeams) {
-      if (!playingThisRound.has(team)) {
-        nextGame[team] = { played: true, round: `Round ${squiggleUpcoming}` };
-      }
-    }
-  }
-  // Fallback for teams with no upcoming entry
-  for (const g of [...sorted].reverse()) {
-    if (!g.hteam || !g.ateam) continue;
-    const home = SQUIGGLE_TO_APP[g.hteam] || g.hteam;
-    const away = SQUIGGLE_TO_APP[g.ateam] || g.ateam;
-    if (!nextGame[home]) nextGame[home] = { opponent: away, round: g.roundname, date: g.date, home: true,  played: true };
-    if (!nextGame[away]) nextGame[away] = { opponent: home, round: g.roundname, date: g.date, home: false, played: true };
+    if (games.length > 0) roundGames[afltablesRound] = games;
   }
 
-  // Build historical fixture/byes from ALL Squiggle rounds (not just Squiggle-complete ones)
-  // so fixture info is available even when AFL Tables publishes data before Squiggle marks complete.
-  const roundGroups = {};
-  for (const g of sorted) {
-    if (!g.hteam || !g.ateam) continue;
-    if (!roundGroups[g.round]) roundGroups[g.round] = [];
-    roundGroups[g.round].push(g);
-  }
-
-  const historicalFixture = {};
-  const historicalByes    = {};
-
-  for (const [sqRound, roundGames] of Object.entries(roundGroups)) {
-    const appRound = parseInt(sqRound);
-    const fixture  = {};
-    const playing  = new Set();
-    for (const g of roundGames) {
-      const home = SQUIGGLE_TO_APP[g.hteam] || g.hteam;
-      const away = SQUIGGLE_TO_APP[g.ateam] || g.ateam;
-      fixture[home] = away;
-      fixture[away] = home;
-      playing.add(home);
-      playing.add(away);
-    }
-    historicalFixture[appRound] = fixture;
-    historicalByes[appRound]    = allTeams.filter(t => !playing.has(t));
-  }
-
-  // Use AFL Tables as the authority on which rounds have stats published.
-  // A round is "complete" if AFL Tables has game pages for it — regardless of
-  // whether Squiggle has marked every game complete yet.
-  await refreshGameLinks();
+  // completedRounds = AFL Tables rounds with stat pages (already in cachedGameLinks)
   const completedRounds = [];
   for (const [afltablesRoundStr, links] of Object.entries(cachedGameLinks)) {
-    if (links.length > 0) {
-      completedRounds.push(parseInt(afltablesRoundStr) - 1); // convert to appRound
-    }
+    if (links.length > 0) completedRounds.push(parseInt(afltablesRoundStr) - 1);
   }
   completedRounds.sort((a, b) => a - b);
 
-  // Derive upcomingRound: first app round not yet in AFL Tables
-  const maxCompleted = completedRounds.length > 0 ? Math.max(...completedRounds) : -1;
-  const derivedUpcoming = maxCompleted + 1;
-  // Use the higher of Squiggle's upcoming and AFL Tables derived — ensures we never
-  // show a round as "upcoming" that AFL Tables already has stats for.
-  const finalUpcoming = Math.max(upcomingRound ?? 0, derivedUpcoming);
+  const completedSet = new Set(completedRounds);
+  const upcomingRound = completedRounds.length > 0 ? Math.max(...completedRounds) + 1 : 0;
 
-  console.log(`Fixture: Squiggle upcoming=${upcomingRound}, AFL Tables completedRounds=[${completedRounds.join(', ')}], finalUpcoming=${finalUpcoming}`);
-  return { nextGame, upcomingRound: finalUpcoming, completedRounds, historicalFixture, historicalByes };
+  // Build historicalFixture + historicalByes for every parsed round
+  const historicalFixture = {};
+  const historicalByes    = {};
+  for (const [afltRoundStr, games] of Object.entries(roundGames)) {
+    const appRound = parseInt(afltRoundStr) - 1;
+    const fixture = {};
+    const playing = new Set();
+    for (const g of games) {
+      fixture[g.home] = g.away;
+      fixture[g.away] = g.home;
+      playing.add(g.home);
+      playing.add(g.away);
+    }
+    historicalFixture[appRound] = fixture;
+    historicalByes[appRound]    = ALL_TEAMS.filter(t => !playing.has(t));
+  }
+
+  // Build nextGame: first unplayed game for each team
+  const nextGame = {};
+  const upcomingAfltRound = upcomingRound + 1;
+  const upcomingGames = roundGames[upcomingAfltRound] || [];
+  const playingNext = new Set();
+  for (const g of upcomingGames) {
+    playingNext.add(g.home);
+    playingNext.add(g.away);
+    if (!g.played) {
+      nextGame[g.home] = { opponent: g.away, round: `Round ${upcomingRound}`, date: g.date, home: true,  venue: g.venue };
+      nextGame[g.away] = { opponent: g.home, round: `Round ${upcomingRound}`, date: g.date, home: false, venue: g.venue };
+    }
+  }
+  // Teams not in the upcoming round have a bye
+  for (const team of ALL_TEAMS) {
+    if (!playingNext.has(team)) nextGame[team] = { played: true, round: `Round ${upcomingRound}` };
+  }
+
+  console.log(`Fixture: AFL Tables completedRounds=[${completedRounds.join(', ')}], upcomingRound=${upcomingRound}`);
+  return { nextGame, upcomingRound, completedRounds, historicalFixture, historicalByes };
 }
 
 async function getOrFetchFixture() {
