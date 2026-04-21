@@ -348,7 +348,8 @@ async function fetchFixture() {
     if (!nextGame[away]) nextGame[away] = { opponent: home, round: g.roundname, date: g.date, home: false, played: true };
   }
 
-  // Build historical fixture/byes for all fully completed rounds
+  // Build historical fixture/byes from ALL Squiggle rounds (not just Squiggle-complete ones)
+  // so fixture info is available even when AFL Tables publishes data before Squiggle marks complete.
   const roundGroups = {};
   for (const g of sorted) {
     if (!g.hteam || !g.ateam) continue;
@@ -356,18 +357,11 @@ async function fetchFixture() {
     roundGroups[g.round].push(g);
   }
 
-  const completedRounds   = [];
   const historicalFixture = {};
   const historicalByes    = {};
 
   for (const [sqRound, roundGames] of Object.entries(roundGroups)) {
-    const sqNum = parseInt(sqRound);
-    if (squiggleUpcoming !== null && sqNum >= squiggleUpcoming) continue;
-    if (!roundGames.every(g => g.complete === 100)) continue;
-
-    const appRound = sqNum;
-    completedRounds.push(appRound);
-
+    const appRound = parseInt(sqRound);
     const fixture  = {};
     const playing  = new Set();
     for (const g of roundGames) {
@@ -381,17 +375,28 @@ async function fetchFixture() {
     historicalFixture[appRound] = fixture;
     historicalByes[appRound]    = allTeams.filter(t => !playing.has(t));
   }
+
+  // Use AFL Tables as the authority on which rounds have stats published.
+  // A round is "complete" if AFL Tables has game pages for it — regardless of
+  // whether Squiggle has marked every game complete yet.
+  await refreshGameLinks();
+  const completedRounds = [];
+  for (const [afltablesRoundStr, links] of Object.entries(cachedGameLinks)) {
+    if (links.length > 0) {
+      completedRounds.push(parseInt(afltablesRoundStr) - 1); // convert to appRound
+    }
+  }
   completedRounds.sort((a, b) => a - b);
 
-  // Cross-reference with AFL Tables: only include rounds that have game data
-  await refreshGameLinks();
-  const verified = completedRounds.filter(r => {
-    const afltablesRound = r + 1;
-    return cachedGameLinks[afltablesRound]?.length > 0;
-  });
+  // Derive upcomingRound: first app round not yet in AFL Tables
+  const maxCompleted = completedRounds.length > 0 ? Math.max(...completedRounds) : -1;
+  const derivedUpcoming = maxCompleted + 1;
+  // Use the higher of Squiggle's upcoming and AFL Tables derived — ensures we never
+  // show a round as "upcoming" that AFL Tables already has stats for.
+  const finalUpcoming = Math.max(upcomingRound ?? 0, derivedUpcoming);
 
-  console.log(`Fixture: upcoming app round ${upcomingRound}, completed: [${completedRounds.join(', ')}], verified with AFL Tables: [${verified.join(', ')}]`);
-  return { nextGame, upcomingRound, completedRounds: verified, historicalFixture, historicalByes };
+  console.log(`Fixture: Squiggle upcoming=${upcomingRound}, AFL Tables completedRounds=[${completedRounds.join(', ')}], finalUpcoming=${finalUpcoming}`);
+  return { nextGame, upcomingRound: finalUpcoming, completedRounds, historicalFixture, historicalByes };
 }
 
 async function getOrFetchFixture() {
